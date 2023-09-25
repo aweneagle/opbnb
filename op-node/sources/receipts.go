@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -359,18 +360,19 @@ type receiptsFetchingJob struct {
 
 	fetcher *IterativeBatchCall[common.Hash, *types.Receipt]
 
-	result types.Receipts
+	result                types.Receipts
+	maxConcurrentRequests int
 }
 
-func NewReceiptsFetchingJob(requester ReceiptsRequester, client rpcClient, maxBatchSize int, block eth.BlockID,
-	receiptHash common.Hash, txHashes []common.Hash) *receiptsFetchingJob {
+func NewReceiptsFetchingJob(requester ReceiptsRequester, client rpcClient, maxBatchSize int, block eth.BlockID, receiptHash common.Hash, txHashes []common.Hash, maxConcurrentRequests int) *receiptsFetchingJob {
 	return &receiptsFetchingJob{
-		requester:    requester,
-		client:       client,
-		maxBatchSize: maxBatchSize,
-		block:        block,
-		receiptHash:  receiptHash,
-		txHashes:     txHashes,
+		requester:             requester,
+		client:                client,
+		maxBatchSize:          maxBatchSize,
+		block:                 block,
+		receiptHash:           receiptHash,
+		txHashes:              txHashes,
+		maxConcurrentRequests: maxConcurrentRequests,
 	}
 }
 
@@ -394,14 +396,12 @@ func (job *receiptsFetchingJob) runFetcher(ctx context.Context) error {
 			job.maxBatchSize,
 		)
 	}
-	// Fetch all receipts
-	for {
-		if err := job.fetcher.Fetch(ctx); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
+
+	err2 := job.concurrentFetch(ctx)
+	if err2 != nil {
+		return err2
 	}
+
 	result, err := job.fetcher.Result()
 	if err != nil { // errors if results are not available yet, should never happen.
 		return err
@@ -414,6 +414,34 @@ func (job *receiptsFetchingJob) runFetcher(ctx context.Context) error {
 	job.result = result
 	job.fetcher = nil
 	job.txHashes = nil
+	return nil
+}
+
+func (job *receiptsFetchingJob) concurrentFetch(ctx context.Context) error {
+	var wg sync.WaitGroup
+	suggestConcurrent := math.Ceil(float64(len(job.txHashes)) / float64(job.maxBatchSize))
+	concurrentRequests := int(math.Min(suggestConcurrent, float64(job.maxConcurrentRequests)))
+	wg.Add(concurrentRequests)
+	errs := make(chan error, concurrentRequests)
+	for i := 0; i < concurrentRequests; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				if err := job.fetcher.Fetch(ctx); err == io.EOF {
+					return
+				} else if err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if len(errs) > 0 {
+		if callErr := <-errs; callErr != nil {
+			return callErr
+		}
+	}
 	return nil
 }
 
